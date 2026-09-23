@@ -291,6 +291,10 @@ def _supabase_config():
         raise RuntimeError("the [supabase] Secrets need both a url and a key")
     # Accept the URL with or without a trailing slash or /rest/v1
     url = url.rstrip("/").removesuffix("/rest/v1").rstrip("/")
+    if re.fullmatch(r"[a-z0-9]{20}", url):
+        url = f"https://{url}.supabase.co"  # just the project ID was given
+    elif not url.startswith(("http://", "https://")):
+        url = "https://" + url  # e.g. "abcd.supabase.co" without https://
     return url, key
 
 
