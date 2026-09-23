@@ -5,9 +5,9 @@ A Streamlit site that collects Lewisham local news, discussion and events from f
 | Source | Method |
 | --- | --- |
 | Reddit r/lewisham | RSS |
-| Lewisham Loop newsletter (Beehiiv) | RSS |
+| The Lewisham Letter (Substack) | RSS |
 | Lewisham Council news | RSS, falling back to reading the news page |
-| We Are Lewisham events | Reads the web page (schema.org event data first, then event cards) |
+| We Are Lewisham events | Reads the web page (schema.org event data, then event cards, then links to `/events/<slug>/`) |
 
 ## Run locally
 

@@ -20,15 +20,27 @@ HEADERS = {"User-Agent": "LewishamLocalHub/1.0 (community news aggregator)"}
 ITEMS_PER_SOURCE = 8
 MAX_EVENTS = 12
 
+# 每個來源可列出多個候選網址，依序嘗試，第一個成功的就採用
 RSS_FEEDS = {
-    "Reddit (r/lewisham)": "https://www.reddit.com/r/lewisham/new/.rss",
-    "Lewisham Loop Newsletter": "https://lewisham-loop.beehiiv.com/feed",
-    "Lewisham Council News": "https://lewisham.gov.uk/news/rss",
+    "Reddit (r/lewisham)": [
+        "https://www.reddit.com/r/lewisham/new/.rss",
+        "https://old.reddit.com/r/lewisham/new/.rss",
+    ],
+    # 原本的 lewisham-loop.beehiiv.com/feed 回傳 404（該電子報不存在），改用 The Lewisham Letter
+    "The Lewisham Letter": [
+        "https://thelewishamletter.substack.com/feed",
+    ],
+    "Lewisham Council News": [
+        "https://lewisham.gov.uk/news/rss",
+        "https://lewisham.gov.uk/news/rss.xml",
+    ],
 }
 COUNCIL_SOURCE = "Lewisham Council News"
 COUNCIL_NEWS_PAGE = "https://lewisham.gov.uk/news"
 EVENTS_SOURCE = "We Are Lewisham"
 EVENTS_URL = "https://www.wearelewisham.com/events/"
+# 列表模式通常是伺服器直接產生的 HTML，比預設頁面更容易解析
+EVENTS_PAGES = [EVENTS_URL + "?display=list", EVENTS_URL]
 
 # 2. 社區分類關鍵字
 # 「Lewisham」幾乎出現在每一則標題裡（例如 "Lewisham Council"），所以放在最後比對，
@@ -83,12 +95,29 @@ def _entry_datetime(entry):
 # 3. 抓取 RSS 來源 (Reddit, Beehiiv, Council)
 # 注意：失敗時直接拋出例外。st.cache_data 不會快取例外，
 # 所以某個網站暫時掛掉時，下次重新整理就會再試，而不是空白 30 分鐘。
+def _try_each(urls, fetch_one):
+    """依序嘗試每個網址，回傳第一個成功的結果；全部失敗則拋出彙整後的錯誤。"""
+    failures = []
+    for url in urls:
+        try:
+            return fetch_one(url)
+        except Exception as e:
+            failures.append(f"{url} → {e}")
+    raise RuntimeError("；".join(failures))
+
+
 @st.cache_data(ttl=1800, show_spinner=False)  # 每 30 分鐘自動更新一次
-def fetch_rss_source(source_name, url):
+def fetch_rss_source(source_name, urls):
+    return _try_each(urls, lambda url: _fetch_one_feed(source_name, url))
+
+
+def _fetch_one_feed(source_name, url):
     # feedparser 本身沒有 timeout 且不會拋出網路錯誤，所以先用 requests 下載
     feed = feedparser.parse(_http_get(url).content)
-    if feed.bozo and not feed.entries:
-        raise ValueError(f"無法解析 RSS：{feed.get('bozo_exception')}")
+    if not feed.entries:
+        # 網址若回傳一般網頁而非 RSS，feedparser 不一定會報錯，只會得到 0 筆
+        reason = feed.get("bozo_exception") or "回應不是 RSS 或沒有任何項目"
+        raise ValueError(f"無法解析 RSS：{reason}")
 
     items = []
     for entry in feed.entries[:ITEMS_PER_SOURCE]:
@@ -157,14 +186,22 @@ def _jsonld_events(soup):
     return found
 
 
+# 活動頁面網址格式為 /events/<slug>/；排除 ?categories= 之類的篩選連結
+_EVENT_LINK = re.compile(r"^https?://(www\.)?wearelewisham\.com/events/[^/?#]+/?$")
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_we_are_lewisham_events():
-    soup = BeautifulSoup(_http_get(EVENTS_URL).text, "html.parser")
+    return _try_each(EVENTS_PAGES, _fetch_events_page)
+
+
+def _fetch_events_page(page_url):
+    soup = BeautifulSoup(_http_get(page_url).text, "html.parser")
     events, seen = [], set()
 
     def add(title, link, start):
-        link = urljoin(EVENTS_URL, link)
-        if not title or link in seen or link.rstrip("/") == EVENTS_URL.rstrip("/"):
+        link = urljoin(page_url, link)
+        if not title or link in seen or not _EVENT_LINK.match(link):
             return
         seen.add(link)
         events.append(make_item(title, link, start, EVENTS_SOURCE, "文化活動"))
@@ -185,29 +222,42 @@ def fetch_we_are_lewisham_events():
                 add(title_tag.get_text(" ", strip=True), link_tag["href"], start)
 
     if not events:
+        # 最後備案：直接收集頁面上所有指向單一活動頁的連結
+        for a in soup.find_all("a", href=True):
+            title = a.get_text(" ", strip=True)
+            if len(title) >= 4 and title.lower() not in {"read more", "more info", "book now", "view event"}:
+                add(title, a["href"], None)
+
+    if not events:
         raise ValueError("找不到活動資料（網站結構可能已變更）")
     return events[:MAX_EVENTS]
 
 
 # 5. 整合所有數據（每個來源獨立處理，一個失敗不影響其他）
 def load_all_sources():
-    items, errors = [], {}
-    for source_name, url in RSS_FEEDS.items():
+    """回傳 (所有項目, 每個來源的狀態)。狀態為筆數 (int) 或錯誤訊息 (str)。"""
+    items, status = [], {}
+    for source_name, urls in RSS_FEEDS.items():
         try:
-            items += fetch_rss_source(source_name, url)
+            found = fetch_rss_source(source_name, tuple(urls))
         except Exception as e:
-            if source_name == COUNCIL_SOURCE:
-                try:
-                    items += fetch_council_news_page()
-                    continue
-                except Exception as fallback_error:
-                    e = fallback_error
-            errors[source_name] = str(e)
+            if source_name != COUNCIL_SOURCE:
+                status[source_name] = str(e)
+                continue
+            try:
+                found = fetch_council_news_page()
+            except Exception as fallback_error:
+                status[source_name] = f"RSS：{e}；新聞頁面：{fallback_error}"
+                continue
+        items += found
+        status[source_name] = len(found)
     try:
-        items += fetch_we_are_lewisham_events()
+        found = fetch_we_are_lewisham_events()
+        items += found
+        status[EVENTS_SOURCE] = len(found)
     except Exception as e:
-        errors[EVENTS_SOURCE] = str(e)
-    return items, errors
+        status[EVENTS_SOURCE] = str(e)
+    return items, status
 
 
 def md_escape(text):
@@ -229,7 +279,7 @@ if st.sidebar.button("🔄 重新整理資料"):
     st.cache_data.clear()
 
 with st.spinner("正在為您同步 Lewisham 最新在地資訊..."):
-    items, errors = load_all_sources()
+    items, source_status = load_all_sources()
 
 all_sources = list(RSS_FEEDS) + [EVENTS_SOURCE]
 columns = ["Title", "Link", "Published", "Source", "Area", "Type"]
@@ -238,8 +288,12 @@ all_data["Published"] = pd.to_datetime(all_data["Published"], utc=True).dt.tz_co
 all_data = all_data.drop_duplicates(subset="Link")
 all_data = all_data.sort_values("Published", ascending=False, na_position="last")
 
-for source_name, message in errors.items():
-    st.sidebar.warning(f"無法讀取 {source_name}：{message}", icon="⚠️")
+with st.sidebar.expander("📡 資料來源狀態", expanded=any(isinstance(v, str) for v in source_status.values())):
+    for source_name, result in source_status.items():
+        if isinstance(result, int):
+            st.success(f"{source_name}：{result} 筆", icon="✅")
+        else:
+            st.warning(f"無法讀取 {source_name}：{result}", icon="⚠️")
 
 selected_source = st.sidebar.multiselect("選擇資訊來源", options=all_sources, default=all_sources)
 selected_area = st.sidebar.selectbox("選擇社區區域", ["All Areas"] + NEIGHBOURHOODS + [BOROUGH_WIDE])
