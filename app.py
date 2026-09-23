@@ -10,30 +10,30 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-# 1. 頁面基礎設定
+# 1. Page set-up
 st.set_page_config(page_title="Lewisham Local Hub", page_icon="🦁", layout="wide")
 
 LONDON = ZoneInfo("Europe/London")
-REQUEST_TIMEOUT = 10  # 秒；避免任何一個網站卡住整個頁面
-# Reddit 等網站會封鎖偽裝成瀏覽器的爬蟲，官方建議使用可辨識的 User-Agent
+REQUEST_TIMEOUT = 10  # seconds; stops one slow site from holding up the whole page
+# Sites such as Reddit block scrapers pretending to be browsers; they ask for an identifiable User-Agent
 HEADERS = {"User-Agent": "LewishamLocalHub/1.0 (community news aggregator)"}
 ITEMS_PER_SOURCE = 8
 MAX_EVENTS = 12
 
-# 每個來源可列出多個候選網址，依序嘗試，第一個成功的就採用
+# Each source can list several candidate URLs; they are tried in order and the first that works is used
 RSS_FEEDS = {
     "Reddit (r/lewisham)": [
         "https://www.reddit.com/r/lewisham/new/.rss",
         "https://old.reddit.com/r/lewisham/new/.rss",
     ],
-    # 原本的 lewisham-loop.beehiiv.com/feed 回傳 404（該電子報不存在），改用 The Lewisham Letter
+    # The original lewisham-loop.beehiiv.com/feed returned 404 (no such newsletter), so The Lewisham Letter is used instead
     "The Lewisham Letter": [
         "https://thelewishamletter.substack.com/feed",
     ],
     "Lewisham Council News": [
         "https://lewisham.gov.uk/news/rss",
         "https://lewisham.gov.uk/news/rss.xml",
-        # 備案：Google News 對 lewisham.gov.uk 的搜尋結果，是穩定的 RSS
+        # Fallback: Google News results for lewisham.gov.uk, which is a reliable RSS feed
         "https://news.google.com/rss/search?q=site:lewisham.gov.uk&hl=en-GB&gl=GB&ceid=GB:en",
     ],
 }
@@ -41,27 +41,27 @@ COUNCIL_SOURCE = "Lewisham Council News"
 COUNCIL_NEWS_PAGE = "https://lewisham.gov.uk/news"
 EVENTS_SOURCE = "We Are Lewisham"
 EVENTS_URL = "https://www.wearelewisham.com/events/"
-# 列表模式通常是伺服器直接產生的 HTML，比預設頁面更容易解析
+# List view is usually plain server-rendered HTML, which is easier to parse than the default page
 EVENTS_PAGES = [EVENTS_URL + "?display=list", EVENTS_URL]
 
-# 2. 社區分類關鍵字
-# 「Lewisham」幾乎出現在每一則標題裡（例如 "Lewisham Council"），所以放在最後比對，
-# 讓較具體的社區名稱優先。
+# 2. Neighbourhood keywords
+# "Lewisham" appears in almost every title (e.g. "Lewisham Council"), so it is checked last
+# to let the more specific neighbourhood names take priority.
 NEIGHBOURHOODS = [
     "Brockley", "Catford", "Deptford", "New Cross", "Sydenham", "Blackheath",
     "Forest Hill", "Ladywell", "Hither Green", "Lee", "Honor Oak", "Crofton Park",
     "Bellingham", "Downham", "Grove Park", "Lewisham",
 ]
-BOROUGH_WIDE = "Borough-Wide"
-# 使用單字邊界，避免 "Lee" 誤判 "Leeds"、"sleep" 等字
+BOROUGH_WIDE = "Borough-wide"
+# Whole-word matching, so "Lee" does not match "Leeds" or "sleep"
 _AREA_PATTERNS = [(area, re.compile(rf"\b{re.escape(area)}\b", re.IGNORECASE)) for area in NEIGHBOURHOODS]
 
 
-def categorize_title(title):
+def categorise_title(title):
     text = str(title)
     for area, pattern in _AREA_PATTERNS:
         if area == "Lewisham":
-            # 只有明確指 Lewisham 市中心時才歸類為 Lewisham，其餘視為全區消息
+            # Only tag as Lewisham when it clearly means the town centre; otherwise treat it as borough-wide news
             if re.search(r"\bLewisham (town centre|high street|station|market|shopping centre)\b", text, re.IGNORECASE):
                 return area
             continue
@@ -74,9 +74,9 @@ def make_item(title, link, published, source, item_type):
     return {
         "Title": title,
         "Link": link,
-        "Published": published,  # timezone-aware datetime 或 None
+        "Published": published,  # timezone-aware datetime or None
         "Source": source,
-        "Area": categorize_title(title),
+        "Area": categorise_title(title),
         "Type": item_type,
     }
 
@@ -88,13 +88,13 @@ def _http_get(url):
 
 
 def _page_diagnostics(response, soup):
-    """爬蟲失敗時說明實際抓到了什麼，方便判斷網站結構。"""
-    title = soup.title.get_text(strip=True) if soup.title else "（無標題）"
+    """Describe what was actually fetched when scraping fails, to help diagnose the site's structure."""
+    title = soup.title.get_text(strip=True) if soup.title else "(no title)"
     hrefs = [a["href"] for a in soup.find_all("a", href=True)]
-    sample = "、".join(hrefs[:15]) or "（無）"
+    sample = ", ".join(hrefs[:15]) or "(none)"
     return (
-        f"實際網址 {response.url}，HTTP {response.status_code}，頁面標題「{title[:80]}」，"
-        f"HTML {len(response.text)} 字元，共 {len(hrefs)} 個連結，例如：{sample}"
+        f"final URL {response.url}, HTTP {response.status_code}, page title \"{title[:80]}\", "
+        f"{len(response.text)} characters of HTML, {len(hrefs)} links, e.g. {sample}"
     )
 
 
@@ -105,47 +105,47 @@ def _entry_datetime(entry):
     return datetime(*parsed[:6], tzinfo=timezone.utc).astimezone(LONDON)
 
 
-# 3. 抓取 RSS 來源 (Reddit, Beehiiv, Council)
-# 注意：失敗時直接拋出例外。st.cache_data 不會快取例外，
-# 所以某個網站暫時掛掉時，下次重新整理就會再試，而不是空白 30 分鐘。
+# 3. RSS sources (Reddit, The Lewisham Letter, Council)
+# Note: failures raise an exception. st.cache_data does not cache exceptions,
+# so if a site is briefly down it is retried on the next refresh rather than staying empty for 30 minutes.
 def _try_each(urls, fetch_one):
-    """依序嘗試每個網址，回傳第一個成功的結果；全部失敗則拋出彙整後的錯誤。"""
+    """Try each URL in turn and return the first success; if all fail, raise a combined error."""
     failures = []
     for url in urls:
         try:
             return fetch_one(url)
         except Exception as e:
             failures.append(f"{url} → {e}")
-    raise RuntimeError("；".join(failures))
+    raise RuntimeError("; ".join(failures))
 
 
-@st.cache_data(ttl=1800, show_spinner=False)  # 每 30 分鐘自動更新一次
+@st.cache_data(ttl=1800, show_spinner=False)  # refresh automatically every 30 minutes
 def fetch_rss_source(source_name, urls):
     return _try_each(urls, lambda url: _fetch_one_feed(source_name, url))
 
 
 def _fetch_one_feed(source_name, url):
-    # feedparser 本身沒有 timeout 且不會拋出網路錯誤，所以先用 requests 下載
+    # feedparser has no timeout and does not raise network errors, so download with requests first
     feed = feedparser.parse(_http_get(url).content)
     if not feed.entries:
-        # 網址若回傳一般網頁而非 RSS，feedparser 不一定會報錯，只會得到 0 筆
-        reason = feed.get("bozo_exception") or "回應不是 RSS 或沒有任何項目"
-        raise ValueError(f"無法解析 RSS：{reason}")
+        # If the URL returns an ordinary web page rather than RSS, feedparser may not complain; it just finds 0 entries
+        reason = feed.get("bozo_exception") or "the response is not RSS or has no entries"
+        raise ValueError(f"could not parse RSS: {reason}")
 
     items = []
     for entry in feed.entries[:ITEMS_PER_SOURCE]:
         title = entry.get("title", "").strip()
         link = entry.get("link", "")
         if "news.google.com" in url:
-            title = title.rsplit(" - ", 1)[0]  # 去掉 Google News 附加的 " - 來源名稱"
+            title = title.rsplit(" - ", 1)[0]  # strip the " - Source name" suffix Google News adds
         if title and link:
-            items.append(make_item(title, link, _entry_datetime(entry), source_name, "新聞 / 討論"))
+            items.append(make_item(title, link, _entry_datetime(entry), source_name, "News / discussion"))
     return items
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_council_news_page():
-    """議會 RSS 失效時的備案：直接解析新聞頁面上的新聞連結。"""
+    """Fallback when the Council RSS fails: read the news links straight from the news page."""
     response = _http_get(COUNCIL_NEWS_PAGE)
     soup = BeautifulSoup(response.text, "html.parser")
     items, seen = [], set()
@@ -156,15 +156,15 @@ def fetch_council_news_page():
         if "/news/" not in path or path.endswith("/news") or link in seen or len(title) < 15:
             continue
         seen.add(link)
-        items.append(make_item(title, link, None, COUNCIL_SOURCE, "新聞 / 討論"))
+        items.append(make_item(title, link, None, COUNCIL_SOURCE, "News / discussion"))
         if len(items) >= ITEMS_PER_SOURCE:
             break
     if not items:
-        raise ValueError(f"新聞頁面上找不到任何新聞連結（{_page_diagnostics(response, soup)}）")
+        raise ValueError(f"no news links found on the news page ({_page_diagnostics(response, soup)})")
     return items
 
 
-# 4. 抓取 We Are Lewisham 文化活動 (網頁爬蟲)
+# 4. We Are Lewisham cultural events (web scraping)
 def _parse_event_date(value):
     if not value:
         return None
@@ -178,7 +178,7 @@ def _parse_event_date(value):
 
 
 def _jsonld_events(soup):
-    """許多活動網站會在頁面中嵌入 schema.org 的 Event 資料，比猜 CSS class 可靠得多。"""
+    """Many event sites embed schema.org Event data in the page, which is far more reliable than guessing CSS classes."""
     found = []
 
     def walk(node):
@@ -202,7 +202,7 @@ def _jsonld_events(soup):
     return found
 
 
-# 活動頁面網址格式為 /events/<slug>/；排除 ?categories= 之類的篩選連結
+# Event page URLs look like /events/<slug>/; filter links such as ?categories= are excluded
 _EVENT_LINK = re.compile(r"^https?://(www\.)?wearelewisham\.com/events/[^/?#]+/?$")
 
 
@@ -221,13 +221,13 @@ def _fetch_events_page(page_url):
         if not title or link in seen or not _EVENT_LINK.match(link):
             return
         seen.add(link)
-        events.append(make_item(title, link, start, EVENTS_SOURCE, "文化活動"))
+        events.append(make_item(title, link, start, EVENTS_SOURCE, "Event"))
 
     for event in _jsonld_events(soup):
         add(str(event.get("name", "")).strip(), event.get("url") or "", _parse_event_date(event.get("startDate")))
 
     if not events:
-        # 備案：尋找 class 含 "event" 的卡片。只取最外層卡片，避免巢狀元素重複計算。
+        # Fallback: look for cards whose class contains "event". Only the outermost cards are kept, so nested elements are not counted twice.
         cards = soup.find_all(["article", "li", "div"], class_=lambda c: c and "event" in c.lower())
         cards = [c for c in cards if not any(p in cards for p in c.parents)] or cards
         for card in cards:
@@ -239,20 +239,20 @@ def _fetch_events_page(page_url):
                 add(title_tag.get_text(" ", strip=True), link_tag["href"], start)
 
     if not events:
-        # 最後備案：直接收集頁面上所有指向單一活動頁的連結
+        # Last resort: collect every link on the page that points to a single event page
         for a in soup.find_all("a", href=True):
             title = a.get_text(" ", strip=True)
             if len(title) >= 4 and title.lower() not in {"read more", "more info", "book now", "view event"}:
                 add(title, a["href"], None)
 
     if not events:
-        raise ValueError(f"找不到活動資料（{_page_diagnostics(response, soup)}）")
+        raise ValueError(f"no event data found ({_page_diagnostics(response, soup)})")
     return events[:MAX_EVENTS]
 
 
-# 5. 整合所有數據（每個來源獨立處理，一個失敗不影響其他）
+# 5. Combine all data (each source is handled separately, so one failure does not affect the others)
 def load_all_sources():
-    """回傳 (所有項目, 每個來源的狀態)。狀態為筆數 (int) 或錯誤訊息 (str)。"""
+    """Return (all items, status of each source). A status is an item count (int) or an error message (str)."""
     items, status = [], {}
     for source_name, urls in RSS_FEEDS.items():
         try:
@@ -264,7 +264,7 @@ def load_all_sources():
             try:
                 found = fetch_council_news_page()
             except Exception as fallback_error:
-                status[source_name] = f"RSS：{e}；新聞頁面：{fallback_error}"
+                status[source_name] = f"RSS: {e}; news page: {fallback_error}"
                 continue
         items += found
         status[source_name] = len(found)
@@ -283,19 +283,19 @@ def md_escape(text):
 
 def format_published(value):
     if value is None or pd.isna(value):
-        return "日期未提供"
-    return value.strftime("%Y-%m-%d %H:%M")
+        return "Date not given"
+    return value.strftime("%-d %b %Y, %H:%M")
 
 
 # 6. UI
-st.title("🦁 Lewisham 綜合在地資訊網")
-st.caption("一站式匯集社群討論、在地電子報、區議會公告與文化活動")
+st.title("🦁 Lewisham Local Hub")
+st.caption("Community discussion, local newsletters, Council news and cultural events, all in one place")
 
-st.sidebar.header("🔍 篩選條件")
-if st.sidebar.button("🔄 重新整理資料"):
+st.sidebar.header("🔍 Filters")
+if st.sidebar.button("🔄 Refresh data"):
     st.cache_data.clear()
 
-with st.spinner("正在為您同步 Lewisham 最新在地資訊..."):
+with st.spinner("Fetching the latest Lewisham news and events..."):
     items, source_status = load_all_sources()
 
 all_sources = list(RSS_FEEDS) + [EVENTS_SOURCE]
@@ -305,43 +305,43 @@ all_data["Published"] = pd.to_datetime(all_data["Published"], utc=True).dt.tz_co
 all_data = all_data.drop_duplicates(subset="Link")
 all_data = all_data.sort_values("Published", ascending=False, na_position="last")
 
-with st.sidebar.expander("📡 資料來源狀態", expanded=any(isinstance(v, str) for v in source_status.values())):
+with st.sidebar.expander("📡 Source status", expanded=any(isinstance(v, str) for v in source_status.values())):
     for source_name, result in source_status.items():
         if isinstance(result, int):
-            st.success(f"{source_name}：{result} 筆", icon="✅")
+            st.success(f"{source_name}: {result} {'item' if result == 1 else 'items'}", icon="✅")
         else:
-            st.warning(f"無法讀取 {source_name}：{result}", icon="⚠️")
+            st.warning(f"Could not load {source_name}: {result}", icon="⚠️")
 
-selected_source = st.sidebar.multiselect("選擇資訊來源", options=all_sources, default=all_sources)
-selected_area = st.sidebar.selectbox("選擇社區區域", ["All Areas"] + NEIGHBOURHOODS + [BOROUGH_WIDE])
-keyword = st.sidebar.text_input("關鍵字搜尋", placeholder="例如：market, library")
+selected_source = st.sidebar.multiselect("Sources", options=all_sources, default=all_sources)
+selected_area = st.sidebar.selectbox("Neighbourhood", ["All Areas"] + NEIGHBOURHOODS + [BOROUGH_WIDE])
+keyword = st.sidebar.text_input("Search by keyword", placeholder="e.g. market, library")
 
-st.sidebar.caption(f"最後更新：{datetime.now(LONDON):%Y-%m-%d %H:%M}（倫敦時間）")
+st.sidebar.caption(f"Last updated: {datetime.now(LONDON):%-d %b %Y, %H:%M} (UK time)")
 
-# 過濾資料
+# Apply filters
 filtered_df = all_data[all_data["Source"].isin(selected_source)]
 if selected_area != "All Areas":
     filtered_df = filtered_df[filtered_df["Area"] == selected_area]
 if keyword.strip():
     filtered_df = filtered_df[filtered_df["Title"].str.contains(keyword.strip(), case=False, regex=False)]
 
-st.subheader(f"最新消息與活動 ({len(filtered_df)} 筆)")
+st.subheader(f"Latest news and events ({len(filtered_df)})")
 
 if all_data.empty:
-    st.error("目前無法從任何來源取得資料，請稍後再試或按左側「重新整理資料」。")
+    st.error("We couldn't load anything from any source just now. Please try again later or click \"Refresh data\" in the sidebar.")
 elif filtered_df.empty:
-    st.info("沒有符合篩選條件的項目，請調整左側的篩選條件。")
+    st.info("Nothing matches your filters. Try changing them in the sidebar.")
 
 for row in filtered_df.itertuples(index=False):
     with st.container():
         col1, col2 = st.columns([4, 1])
         with col1:
-            prefix = "🎉 [活動] " if row.Type == "文化活動" else ""
+            prefix = "🎉 [Event] " if row.Type == "Event" else ""
             safe_link = row.Link.replace("(", "%28").replace(")", "%29").replace(" ", "%20")
             st.markdown(f"### [{prefix}{md_escape(row.Title)}]({safe_link})")
             st.caption(
-                f"📍 **區域:** {row.Area} | 📰 **來源:** {row.Source} | 🕒 {format_published(row.Published)}"
+                f"📍 **Area:** {row.Area} | 📰 **Source:** {row.Source} | 🕒 {format_published(row.Published)}"
             )
         with col2:
-            st.link_button("查看詳情 ↗️", row.Link)
+            st.link_button("Read more ↗️", row.Link)
         st.divider()

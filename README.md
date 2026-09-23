@@ -20,4 +20,4 @@ streamlit run app.py
 
 On [Streamlit Community Cloud](https://streamlit.io/cloud), connect this repository and set the main file to `app.py`. Streamlit installs the packages in `requirements.txt` for you.
 
-Feeds refresh every 30 minutes and events every hour. The **重新整理資料** (refresh) button in the sidebar forces an immediate refresh.
+Feeds refresh every 30 minutes and events every hour. The **Refresh data** button in the sidebar forces an immediate refresh.
