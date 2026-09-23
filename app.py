@@ -277,6 +277,38 @@ def load_all_sources():
     return items, status
 
 
+# 6. Visitor counter
+# Streamlit Cloud wipes local files on every restart, so the count lives in Supabase.
+# See supabase_setup.sql and the README for the one-off set-up.
+def _supabase_config():
+    try:
+        conf = st.secrets["supabase"]
+        return conf["url"].rstrip("/"), conf["key"]
+    except Exception:
+        return None  # not configured yet: the counter is simply hidden
+
+
+def record_visit():
+    """Add one visit per browser session and return the new total (None if unavailable)."""
+    if "visit_count" not in st.session_state:
+        st.session_state.visit_count = None  # set first, so a failure is not retried on every click
+        config = _supabase_config()
+        if config:
+            url, key = config
+            try:
+                response = requests.post(
+                    f"{url}/rest/v1/rpc/increment_visits",
+                    headers={"apikey": key, "Content-Type": "application/json"},
+                    json={},
+                    timeout=5,
+                )
+                response.raise_for_status()
+                st.session_state.visit_count = int(response.json())
+            except Exception:
+                pass
+    return st.session_state.visit_count
+
+
 def md_escape(text):
     return re.sub(r"([\\`*_{}\[\]()#+\-.!|<>~])", r"\\\1", str(text))
 
@@ -287,7 +319,7 @@ def format_published(value):
     return value.strftime("%-d %b %Y, %H:%M")
 
 
-# 6. UI
+# 7. UI
 st.title("🦁 Lewisham Local Hub")
 st.caption("Community discussion, local newsletters, Council news and cultural events, all in one place")
 
@@ -315,6 +347,10 @@ with st.sidebar.expander("📡 Source status", expanded=any(isinstance(v, str) f
 selected_source = st.sidebar.multiselect("Sources", options=all_sources, default=all_sources)
 selected_area = st.sidebar.selectbox("Neighbourhood", ["All Areas"] + NEIGHBOURHOODS + [BOROUGH_WIDE])
 keyword = st.sidebar.text_input("Search by keyword", placeholder="e.g. market, library")
+
+visit_count = record_visit()
+if visit_count is not None:
+    st.sidebar.metric("👀 Visits", f"{visit_count:,}")
 
 st.sidebar.caption(f"Last updated: {datetime.now(LONDON):%-d %b %Y, %H:%M} (UK time)")
 
