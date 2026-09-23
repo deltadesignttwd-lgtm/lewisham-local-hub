@@ -50,3 +50,6 @@ drop policy if exists "Anyone can upload an ad image" on storage.objects;
 create policy "Anyone can upload an ad image"
     on storage.objects for insert to anon
     with check (bucket_id = 'ad-images');
+
+-- 4. Tell the Supabase API about the new table straight away
+notify pgrst, 'reload schema';
