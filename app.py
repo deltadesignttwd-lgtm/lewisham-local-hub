@@ -281,32 +281,47 @@ def load_all_sources():
 # Streamlit Cloud wipes local files on every restart, so the count lives in Supabase.
 # See supabase_setup.sql and the README for the one-off set-up.
 def _supabase_config():
+    """Return (url, key), or raise with a plain-English reason if the secrets are missing."""
     try:
         conf = st.secrets["supabase"]
-        return conf["url"].rstrip("/"), conf["key"]
     except Exception:
-        return None  # not configured yet: the counter is simply hidden
+        raise RuntimeError("not set up: no [supabase] section in the app's Secrets") from None
+    url, key = str(conf.get("url", "")).strip(), str(conf.get("key", "")).strip()
+    if not url or not key:
+        raise RuntimeError("the [supabase] Secrets need both a url and a key")
+    # Accept the URL with or without a trailing slash or /rest/v1
+    url = url.rstrip("/").removesuffix("/rest/v1").rstrip("/")
+    return url, key
+
+
+def _explain_counter_error(response):
+    body = response.text[:200]
+    if response.status_code in (401, 403):
+        return f"Supabase rejected the key (HTTP {response.status_code}); use the publishable or anon key. {body}"
+    if response.status_code == 404:
+        return f"the increment_visits function was not found; run supabase_setup.sql in the SQL Editor. {body}"
+    return f"HTTP {response.status_code}: {body}"
 
 
 def record_visit():
-    """Add one visit per browser session and return the new total (None if unavailable)."""
+    """Add one visit per browser session and return (total, error message)."""
     if "visit_count" not in st.session_state:
-        st.session_state.visit_count = None  # set first, so a failure is not retried on every click
-        config = _supabase_config()
-        if config:
-            url, key = config
-            try:
-                response = requests.post(
-                    f"{url}/rest/v1/rpc/increment_visits",
-                    headers={"apikey": key, "Content-Type": "application/json"},
-                    json={},
-                    timeout=5,
-                )
-                response.raise_for_status()
-                st.session_state.visit_count = int(response.json())
-            except Exception:
-                pass
-    return st.session_state.visit_count
+        # Set first, so a failure is not retried on every click in the same session
+        st.session_state.visit_count, st.session_state.visit_error = None, None
+        try:
+            url, key = _supabase_config()
+            response = requests.post(
+                f"{url}/rest/v1/rpc/increment_visits",
+                headers={"apikey": key, "Content-Type": "application/json"},
+                json={},
+                timeout=5,
+            )
+            if not response.ok:
+                raise RuntimeError(_explain_counter_error(response))
+            st.session_state.visit_count = int(response.json())
+        except Exception as e:
+            st.session_state.visit_error = str(e)
+    return st.session_state.visit_count, st.session_state.visit_error
 
 
 def md_escape(text):
@@ -337,18 +352,23 @@ all_data["Published"] = pd.to_datetime(all_data["Published"], utc=True).dt.tz_co
 all_data = all_data.drop_duplicates(subset="Link")
 all_data = all_data.sort_values("Published", ascending=False, na_position="last")
 
-with st.sidebar.expander("📡 Source status", expanded=any(isinstance(v, str) for v in source_status.values())):
+visit_count, visit_error = record_visit()
+
+with st.sidebar.expander(
+    "📡 Source status", expanded=bool(visit_error) or any(isinstance(v, str) for v in source_status.values())
+):
     for source_name, result in source_status.items():
         if isinstance(result, int):
             st.success(f"{source_name}: {result} {'item' if result == 1 else 'items'}", icon="✅")
         else:
             st.warning(f"Could not load {source_name}: {result}", icon="⚠️")
+    if visit_error:
+        st.warning(f"Visitor counter: {visit_error}", icon="⚠️")
 
 selected_source = st.sidebar.multiselect("Sources", options=all_sources, default=all_sources)
 selected_area = st.sidebar.selectbox("Neighbourhood", ["All Areas"] + NEIGHBOURHOODS + [BOROUGH_WIDE])
 keyword = st.sidebar.text_input("Search by keyword", placeholder="e.g. market, library")
 
-visit_count = record_visit()
 if visit_count is not None:
     st.sidebar.metric("👀 Visits", f"{visit_count:,}")
 
