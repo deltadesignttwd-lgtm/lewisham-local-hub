@@ -33,6 +33,8 @@ RSS_FEEDS = {
     "Lewisham Council News": [
         "https://lewisham.gov.uk/news/rss",
         "https://lewisham.gov.uk/news/rss.xml",
+        # 備案：Google News 對 lewisham.gov.uk 的搜尋結果，是穩定的 RSS
+        "https://news.google.com/rss/search?q=site:lewisham.gov.uk&hl=en-GB&gl=GB&ceid=GB:en",
     ],
 }
 COUNCIL_SOURCE = "Lewisham Council News"
@@ -85,6 +87,17 @@ def _http_get(url):
     return response
 
 
+def _page_diagnostics(response, soup):
+    """爬蟲失敗時說明實際抓到了什麼，方便判斷網站結構。"""
+    title = soup.title.get_text(strip=True) if soup.title else "（無標題）"
+    hrefs = [a["href"] for a in soup.find_all("a", href=True)]
+    sample = "、".join(hrefs[:15]) or "（無）"
+    return (
+        f"實際網址 {response.url}，HTTP {response.status_code}，頁面標題「{title[:80]}」，"
+        f"HTML {len(response.text)} 字元，共 {len(hrefs)} 個連結，例如：{sample}"
+    )
+
+
 def _entry_datetime(entry):
     parsed = entry.get("published_parsed") or entry.get("updated_parsed")
     if not parsed:
@@ -123,6 +136,8 @@ def _fetch_one_feed(source_name, url):
     for entry in feed.entries[:ITEMS_PER_SOURCE]:
         title = entry.get("title", "").strip()
         link = entry.get("link", "")
+        if "news.google.com" in url:
+            title = title.rsplit(" - ", 1)[0]  # 去掉 Google News 附加的 " - 來源名稱"
         if title and link:
             items.append(make_item(title, link, _entry_datetime(entry), source_name, "新聞 / 討論"))
     return items
@@ -131,7 +146,8 @@ def _fetch_one_feed(source_name, url):
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_council_news_page():
     """議會 RSS 失效時的備案：直接解析新聞頁面上的新聞連結。"""
-    soup = BeautifulSoup(_http_get(COUNCIL_NEWS_PAGE).text, "html.parser")
+    response = _http_get(COUNCIL_NEWS_PAGE)
+    soup = BeautifulSoup(response.text, "html.parser")
     items, seen = [], set()
     for a in soup.find_all("a", href=True):
         link = urljoin(COUNCIL_NEWS_PAGE, a["href"])
@@ -144,7 +160,7 @@ def fetch_council_news_page():
         if len(items) >= ITEMS_PER_SOURCE:
             break
     if not items:
-        raise ValueError("新聞頁面上找不到任何新聞連結")
+        raise ValueError(f"新聞頁面上找不到任何新聞連結（{_page_diagnostics(response, soup)}）")
     return items
 
 
@@ -196,7 +212,8 @@ def fetch_we_are_lewisham_events():
 
 
 def _fetch_events_page(page_url):
-    soup = BeautifulSoup(_http_get(page_url).text, "html.parser")
+    response = _http_get(page_url)
+    soup = BeautifulSoup(response.text, "html.parser")
     events, seen = [], set()
 
     def add(title, link, start):
@@ -229,7 +246,7 @@ def _fetch_events_page(page_url):
                 add(title, a["href"], None)
 
     if not events:
-        raise ValueError("找不到活動資料（網站結構可能已變更）")
+        raise ValueError(f"找不到活動資料（{_page_diagnostics(response, soup)}）")
     return events[:MAX_EVENTS]
 
 
