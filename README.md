@@ -30,3 +30,13 @@ The sidebar shows a lasting visit count stored in [Supabase](https://supabase.co
 2. In **SQL Editor**, run the contents of `supabase_setup.sql`.
 3. In **Project Settings → API Keys**, copy the project URL and the publishable (or `anon`) key.
 4. In Streamlit Cloud, go to **Manage app → ⋮ → Settings → Secrets** and paste the lines from `.streamlit/secrets.toml.example` with your values filled in.
+
+## Local business ads (optional)
+
+A "Local businesses" column lets businesses submit a free ad (name, description, neighbourhood, website, phone, contact email and an optional image). Ads only appear once you approve them.
+
+**Set-up (once):** in Supabase, open **SQL Editor**, run the contents of `supabase_ads_setup.sql`. It uses the same Secrets as the visitor counter.
+
+**Approving an ad:** in Supabase, open **Table Editor → business_ads**, tick `approved` on the row and save. It appears on the site within 5 minutes. Optionally set `expires_on` to a date after which the ad disappears. To remove an ad, untick `approved` or delete the row.
+
+Contact emails are stored for you only and are never shown on the site.

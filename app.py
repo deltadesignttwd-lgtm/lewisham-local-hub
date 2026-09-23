@@ -1,7 +1,8 @@
 import json
 import re
+import uuid
 from datetime import datetime, timezone
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import feedparser
@@ -298,12 +299,20 @@ def _supabase_config():
     return url, key
 
 
-def _explain_counter_error(response):
+def _supabase_headers(key, **extra):
+    headers = {"apikey": key}
+    if not key.startswith("sb_"):
+        headers["Authorization"] = f"Bearer {key}"  # older "anon" keys are JWTs and also go here
+    headers.update(extra)
+    return headers
+
+
+def _explain_supabase_error(response, missing):
     body = response.text[:200]
     if response.status_code in (401, 403):
-        return f"Supabase rejected the key (HTTP {response.status_code}); use the publishable or anon key. {body}"
+        return f"Supabase rejected the request (HTTP {response.status_code}); check the key and the set-up SQL. {body}"
     if response.status_code == 404:
-        return f"the increment_visits function was not found; run supabase_setup.sql in the SQL Editor. {body}"
+        return f"{missing} {body}"
     return f"HTTP {response.status_code}: {body}"
 
 
@@ -316,16 +325,173 @@ def record_visit():
             url, key = _supabase_config()
             response = requests.post(
                 f"{url}/rest/v1/rpc/increment_visits",
-                headers={"apikey": key, "Content-Type": "application/json"},
+                headers=_supabase_headers(key, **{"Content-Type": "application/json"}),
                 json={},
                 timeout=5,
             )
             if not response.ok:
-                raise RuntimeError(_explain_counter_error(response))
+                raise RuntimeError(_explain_supabase_error(
+                    response, "the increment_visits function was not found; run supabase_setup.sql in the SQL Editor."
+                ))
             st.session_state.visit_count = int(response.json())
         except Exception as e:
             st.session_state.visit_error = str(e)
     return st.session_state.visit_count, st.session_state.visit_error
+
+
+# 7. Local business ads
+# Businesses submit ads through a form; they are stored in Supabase and only shown once
+# the site owner ticks "approved". See supabase_ads_setup.sql and the README.
+AD_COLUMNS = "id,created_at,business_name,description,area,website,phone,image_url"
+AD_IMAGE_BUCKET = "ad-images"
+AD_IMAGE_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+AD_IMAGE_MAX_BYTES = 2 * 1024 * 1024
+MAX_ADS_SHOWN = 12
+MAX_SUBMISSIONS_PER_SESSION = 3
+ADS_TABLE_MISSING = "the business_ads table was not found; run supabase_ads_setup.sql in the SQL Editor."
+
+
+@st.cache_data(ttl=300, show_spinner=False)  # newly approved ads appear within 5 minutes
+def fetch_ads(url, key):
+    response = requests.get(
+        f"{url}/rest/v1/business_ads",
+        params={"select": AD_COLUMNS, "order": "created_at.desc", "limit": MAX_ADS_SHOWN},
+        headers=_supabase_headers(key),
+        timeout=REQUEST_TIMEOUT,
+    )
+    if not response.ok:
+        raise RuntimeError(_explain_supabase_error(response, ADS_TABLE_MISSING))
+    return response.json()
+
+
+def load_ads():
+    """Return (approved ads, error message)."""
+    try:
+        return fetch_ads(*_supabase_config()), None
+    except Exception as e:
+        return [], str(e)
+
+
+def normalise_website(value):
+    value = value.strip()
+    if not value:
+        return None
+    if not value.startswith(("http://", "https://")):
+        value = "https://" + value
+    parsed = urlparse(value)
+    if "." not in parsed.netloc or " " in value:
+        raise ValueError("Please enter a valid website address, e.g. www.example.co.uk")
+    return value
+
+
+def _upload_ad_image(url, key, image):
+    extension = AD_IMAGE_TYPES[image.type]
+    path = f"{uuid.uuid4().hex}.{extension}"
+    response = requests.post(
+        f"{url}/storage/v1/object/{AD_IMAGE_BUCKET}/{path}",
+        headers=_supabase_headers(key, **{"Content-Type": image.type, "x-upsert": "false"}),
+        data=image.getvalue(),
+        timeout=30,
+    )
+    if not response.ok:
+        raise RuntimeError(_explain_supabase_error(
+            response, "the ad-images storage bucket was not found; run supabase_ads_setup.sql in the SQL Editor."
+        ))
+    return f"{url}/storage/v1/object/public/{AD_IMAGE_BUCKET}/{path}"
+
+
+def submit_ad(ad, image):
+    url, key = _supabase_config()
+    if image is not None:
+        ad["image_url"] = _upload_ad_image(url, key, image)
+    response = requests.post(
+        f"{url}/rest/v1/business_ads",
+        headers=_supabase_headers(key, **{"Content-Type": "application/json", "Prefer": "return=minimal"}),
+        json=ad,
+        timeout=REQUEST_TIMEOUT,
+    )
+    if not response.ok:
+        raise RuntimeError(_explain_supabase_error(response, ADS_TABLE_MISSING))
+
+
+def validate_ad_form(name, description, website, phone, email, image, confirmed):
+    """Return (cleaned ad, list of problems)."""
+    problems = []
+    if len(name.strip()) < 2:
+        problems.append("Please enter your business name.")
+    if len(description.strip()) < 10:
+        problems.append("Please add a short description (at least 10 characters).")
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email.strip()):
+        problems.append("Please enter a valid email address so we can contact you about your ad.")
+    try:
+        website = normalise_website(website)
+    except ValueError as e:
+        problems.append(str(e))
+        website = None
+    if image is not None:
+        if image.type not in AD_IMAGE_TYPES:
+            problems.append("The image must be a JPG, PNG or WebP file.")
+        elif image.size > AD_IMAGE_MAX_BYTES:
+            problems.append("The image must be 2 MB or smaller.")
+    if not confirmed:
+        problems.append("Please tick the box to confirm the ad is for a genuine local business.")
+    ad = {
+        "business_name": name.strip(),
+        "description": description.strip(),
+        "website": website,
+        "phone": phone.strip() or None,
+        "email": email.strip(),
+    }
+    return ad, problems
+
+
+def render_ad(ad, supabase_url):
+    with st.container(border=True):
+        image_url = ad.get("image_url") or ""
+        # Only show images from our own storage bucket
+        if supabase_url and image_url.startswith(f"{supabase_url}/storage/v1/object/public/{AD_IMAGE_BUCKET}/"):
+            st.image(image_url)
+        st.markdown(f"**{md_escape(ad['business_name'])}**")
+        st.caption(f"📍 {md_escape(ad['area'])}")
+        st.markdown(md_escape(ad["description"]))
+        if ad.get("phone"):
+            st.caption(f"📞 {md_escape(ad['phone'])}")
+        website = ad.get("website") or ""
+        if website.startswith(("http://", "https://")):
+            st.link_button("Visit website ↗️", website, use_container_width=True)
+
+
+def render_ad_form():
+    with st.expander("📣 Advertise your business for free"):
+        st.caption("Ads are checked before they appear. Your email is never shown on the site.")
+        with st.form("ad_form", clear_on_submit=True):
+            name = st.text_input("Business name *", max_chars=80)
+            description = st.text_area("Short description *", max_chars=300)
+            area = st.selectbox("Neighbourhood *", NEIGHBOURHOODS + [BOROUGH_WIDE])
+            website = st.text_input("Website", max_chars=200, placeholder="www.example.co.uk")
+            phone = st.text_input("Phone", max_chars=30)
+            email = st.text_input("Contact email * (not shown publicly)", max_chars=120)
+            image = st.file_uploader("Logo or photo (optional, max 2 MB)", type=["jpg", "jpeg", "png", "webp"])
+            confirmed = st.checkbox("I confirm this ad is for a genuine local business and I have the right to use this image.")
+            submitted = st.form_submit_button("Submit for review", use_container_width=True)
+
+        if not submitted:
+            return
+        if st.session_state.get("ads_submitted", 0) >= MAX_SUBMISSIONS_PER_SESSION:
+            st.error("Thanks, we've received your ads. Please get in touch if you need to send more.")
+            return
+        ad, problems = validate_ad_form(name, description, website, phone, email, image, confirmed)
+        if problems:
+            st.error("\n".join(f"- {p}" for p in problems))
+            return
+        ad["area"] = area
+        try:
+            submit_ad(ad, image)
+        except Exception as e:
+            st.error(f"Sorry, we couldn't send your ad just now. Please try again later. ({e})")
+            return
+        st.session_state.ads_submitted = st.session_state.get("ads_submitted", 0) + 1
+        st.success("Thanks! Your ad has been sent for review and will appear here once approved.")
 
 
 def md_escape(text):
@@ -338,7 +504,7 @@ def format_published(value):
     return value.strftime("%-d %b %Y, %H:%M")
 
 
-# 7. UI
+# 8. UI
 st.title("🦁 Lewisham Local Hub")
 st.caption("Community discussion, local newsletters, Council news and cultural events, all in one place")
 
@@ -357,9 +523,11 @@ all_data = all_data.drop_duplicates(subset="Link")
 all_data = all_data.sort_values("Published", ascending=False, na_position="last")
 
 visit_count, visit_error = record_visit()
+ads, ads_error = load_ads()
 
 with st.sidebar.expander(
-    "📡 Source status", expanded=bool(visit_error) or any(isinstance(v, str) for v in source_status.values())
+    "📡 Source status",
+    expanded=bool(visit_error or ads_error) or any(isinstance(v, str) for v in source_status.values()),
 ):
     for source_name, result in source_status.items():
         if isinstance(result, int):
@@ -368,6 +536,8 @@ with st.sidebar.expander(
             st.warning(f"Could not load {source_name}: {result}", icon="⚠️")
     if visit_error:
         st.warning(f"Visitor counter: {visit_error}", icon="⚠️")
+    if ads_error:
+        st.warning(f"Business ads: {ads_error}", icon="⚠️")
 
 selected_source = st.sidebar.multiselect("Sources", options=all_sources, default=all_sources)
 selected_area = st.sidebar.selectbox("Neighbourhood", ["All Areas"] + NEIGHBOURHOODS + [BOROUGH_WIDE])
@@ -385,23 +555,41 @@ if selected_area != "All Areas":
 if keyword.strip():
     filtered_df = filtered_df[filtered_df["Title"].str.contains(keyword.strip(), case=False, regex=False)]
 
-st.subheader(f"Latest news and events ({len(filtered_df)})")
+news_col, ads_col = st.columns([3, 1], gap="large")
 
-if all_data.empty:
-    st.error("We couldn't load anything from any source just now. Please try again later or click \"Refresh data\" in the sidebar.")
-elif filtered_df.empty:
-    st.info("Nothing matches your filters. Try changing them in the sidebar.")
+with news_col:
+    st.subheader(f"Latest news and events ({len(filtered_df)})")
 
-for row in filtered_df.itertuples(index=False):
-    with st.container():
-        col1, col2 = st.columns([4, 1])
-        with col1:
-            prefix = "🎉 [Event] " if row.Type == "Event" else ""
-            safe_link = row.Link.replace("(", "%28").replace(")", "%29").replace(" ", "%20")
-            st.markdown(f"### [{prefix}{md_escape(row.Title)}]({safe_link})")
-            st.caption(
-                f"📍 **Area:** {row.Area} | 📰 **Source:** {row.Source} | 🕒 {format_published(row.Published)}"
-            )
-        with col2:
-            st.link_button("Read more ↗️", row.Link)
-        st.divider()
+    if all_data.empty:
+        st.error("We couldn't load anything from any source just now. Please try again later or click \"Refresh data\" in the sidebar.")
+    elif filtered_df.empty:
+        st.info("Nothing matches your filters. Try changing them in the sidebar.")
+
+    for row in filtered_df.itertuples(index=False):
+        with st.container():
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                prefix = "🎉 [Event] " if row.Type == "Event" else ""
+                safe_link = row.Link.replace("(", "%28").replace(")", "%29").replace(" ", "%20")
+                st.markdown(f"### [{prefix}{md_escape(row.Title)}]({safe_link})")
+                st.caption(
+                    f"📍 **Area:** {row.Area} | 📰 **Source:** {row.Source} | 🕒 {format_published(row.Published)}"
+                )
+            with col2:
+                st.link_button("Read more ↗️", row.Link)
+            st.divider()
+
+with ads_col:
+    st.subheader("🏪 Local businesses")
+    try:
+        supabase_url = _supabase_config()[0]
+    except Exception:
+        supabase_url = None
+    # Ads for the chosen neighbourhood come first
+    if selected_area != "All Areas":
+        ads = sorted(ads, key=lambda ad: ad.get("area") != selected_area)
+    if not ads:
+        st.caption("No local business ads yet. Be the first!")
+    for ad in ads:
+        render_ad(ad, supabase_url)
+    render_ad_form()
