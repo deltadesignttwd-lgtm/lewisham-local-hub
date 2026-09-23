@@ -40,3 +40,5 @@ A "Local businesses" column lets businesses submit a free ad (name, description,
 **Approving an ad:** in Supabase, open **Table Editor → business_ads**, tick `approved` on the row and save. It appears on the site within 5 minutes. Optionally set `expires_on` to a date after which the ad disappears. To remove an ad, untick `approved` or delete the row.
 
 Contact emails are stored for you only and are never shown on the site.
+
+**Email alerts for new ads (optional):** create a Gmail App Password (Google Account → Security → 2-Step Verification → App passwords) and add an `[email]` section to the Streamlit Secrets, as in `.streamlit/secrets.toml.example`. Each new submission then emails you its details and a link to approve it.

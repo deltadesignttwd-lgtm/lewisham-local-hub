@@ -1,7 +1,9 @@
 import json
 import re
+import smtplib
 import uuid
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
@@ -402,6 +404,7 @@ def _upload_ad_image(url, key, image):
 
 def submit_ad(ad, image):
     url, key = _supabase_config()
+    ad = dict(ad)
     if image is not None:
         ad["image_url"] = _upload_ad_image(url, key, image)
     response = requests.post(
@@ -412,6 +415,45 @@ def submit_ad(ad, image):
     )
     if not response.ok:
         raise RuntimeError(_explain_supabase_error(response, ADS_TABLE_MISSING))
+    notify_new_ad(ad, url)
+
+
+def notify_new_ad(ad, supabase_url):
+    """Email the site owner about a new ad. Needs an [email] section in Secrets; skipped if missing."""
+    try:
+        conf = st.secrets["email"]
+        sender, password = conf["gmail_address"], conf["app_password"]
+        send_to = conf.get("send_to", sender)
+    except Exception:
+        return  # email alerts not set up
+    project_id = urlparse(supabase_url).netloc.split(".")[0]
+    one_line = lambda text: " ".join(str(text or "").split())  # no line breaks in email headers
+
+    message = EmailMessage()
+    message["Subject"] = f"New ad to review: {one_line(ad['business_name'])[:80]}"
+    message["From"] = sender
+    message["To"] = send_to
+    message["Reply-To"] = one_line(ad["email"])
+    message.set_content(
+        "A new local business ad has been submitted on Lewisham Local Hub.\n\n"
+        f"Business:    {ad['business_name']}\n"
+        f"Area:        {ad['area']}\n"
+        f"Description: {ad['description']}\n"
+        f"Website:     {ad.get('website') or '-'}\n"
+        f"Phone:       {ad.get('phone') or '-'}\n"
+        f"Email:       {ad['email']}\n"
+        f"Image:       {ad.get('image_url') or '-'}\n\n"
+        "To publish it, open the business_ads table and set approved to TRUE:\n"
+        f"https://supabase.com/dashboard/project/{project_id}/editor\n\n"
+        "Reply to this email to contact the business directly."
+    )
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as smtp:
+            smtp.login(sender, password.replace(" ", ""))
+            smtp.send_message(message)
+    except Exception as e:
+        # The ad is already saved, so don't bother the advertiser; just note it in the app logs
+        print(f"Could not send new-ad email: {e}")
 
 
 def validate_ad_form(name, description, website, phone, email, image, confirmed):
